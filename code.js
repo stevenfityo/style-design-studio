@@ -538,6 +538,73 @@ async function createPreviewFrame(msg) {
   figma.ui.postMessage({ type: 'preview-created', rows: rows.length });
 }
 
+// ─── AUDIT HELPERS ───────────────────────────────────────────────────────────
+
+// Normalise a lineHeight object ({unit, value} | {unit:'AUTO'}) → comparable string
+function lhKey(lh) {
+  if (!lh || lh.unit === 'AUTO') return 'auto';
+  // Round PIXELS/PERCENT to 2dp so float noise doesn't split groups
+  return lh.unit + ':' + Math.round(lh.value * 100) / 100;
+}
+
+// Font style string → { weight, italic }. Font-agnostic, so "Semibold"
+// (Segoe UI), "Semi Bold" (Inter) and "SemiBold" (IBM Plex) all compare equal.
+function parseFontStyle(style) {
+  const s = String(style || '').toLowerCase().replace(/[\s_-]+/g, '');
+  const italic = s.indexOf('italic') !== -1 || s.indexOf('oblique') !== -1;
+  const w = s.replace('italic', '').replace('oblique', '');
+  let weight = 400;
+  if (/^(thin|hairline)/.test(w))                         weight = 100;
+  else if (/^(extralight|ultralight)/.test(w))            weight = 200;
+  else if (/^(semilight|demilight)/.test(w))              weight = 350;
+  else if (/^light/.test(w))                              weight = 300;
+  else if (/^(regular|normal|book|roman)?$/.test(w))      weight = 400;
+  else if (/^medium/.test(w))                             weight = 500;
+  else if (/^(semibold|demibold)/.test(w))                weight = 600;
+  else if (/^(extrabold|ultrabold)/.test(w))              weight = 800;
+  else if (/^bold/.test(w))                               weight = 700;
+  else if (/^(black|heavy)/.test(w))                      weight = 900;
+  return { weight, italic };
+}
+
+function sameWeight(a, b) {
+  const pa = parseFontStyle(a), pb = parseFontStyle(b);
+  return pa.weight === pb.weight && pa.italic === pb.italic;
+}
+
+// Fonts must be loaded before any text property can change
+async function loadNodeFonts(node) {
+  const fonts = node.characters.length > 0
+    ? node.getRangeAllFontNames(0, node.characters.length)
+    : (node.fontName !== figma.mixed ? [node.fontName] : []);
+  for (const f of fonts) {
+    try { await figma.loadFontAsync(f); } catch (_) {}
+  }
+}
+
+async function setStyleId(node, styleId) {
+  if (typeof node.setTextStyleIdAsync === 'function') await node.setTextStyleIdAsync(styleId);
+  else node.textStyleId = styleId;
+}
+
+// Typography fields that count as "a variable is bound"
+const TEXT_VAR_FIELDS = ['fontSize', 'lineHeight', 'fontFamily', 'fontStyle', 'fontWeight'];
+
+function hasBoundTextVars(node) {
+  const bv = node.boundVariables || {};
+  return TEXT_VAR_FIELDS.some(f => {
+    const v = bv[f];
+    return v && (Array.isArray(v) ? v.length > 0 : true);
+  });
+}
+
+// Short human label for a text node's typography, e.g. "Inter 14/20 Regular"
+function typoLabel(p) {
+  const lh = p.lineHeight === 'auto' ? 'auto'
+    : (p.lineHeight.indexOf('PERCENT:') === 0 ? p.lineHeight.slice(8) + '%' : p.lineHeight.slice(7));
+  return p.fontFamily + ' ' + p.fontSize + '/' + lh + ' ' + p.fontStyle;
+}
+
 // ─── AUDIT: SCAN TEXT NODES WITHOUT STYLE ────────────────────────────────────
 
 async function auditScan(msg) {
@@ -617,13 +684,6 @@ async function auditScan(msg) {
     return '(Page level)';
   }
 
-  // Normalise a lineHeight object ({unit, value} | {unit:'AUTO'}) → comparable string
-  function lhKey(lh) {
-    if (!lh || lh.unit === 'AUTO') return 'auto';
-    // Round PIXELS/PERCENT to 2dp so float noise doesn't split groups
-    return lh.unit + ':' + Math.round(lh.value * 100) / 100;
-  }
-
   // Resolve fontSize + fontStyle + lineHeight from a potentially mixed text node
   function getTextProps(node) {
     const isMixed = node.fontSize === figma.mixed || node.fontName === figma.mixed
@@ -637,33 +697,92 @@ async function auditScan(msg) {
     return { fontSize: node.fontSize, fontStyle: node.fontName.style, fontFamily: node.fontName.family, lineHeight: lhKey(node.lineHeight) };
   }
 
-  // Auto-match against local styles, Figma-style: tightest match first, then
-  // progressively relax. fontFamily is the key precision gain over the old
-  // size+style-only matcher — a 16px Regular in Inter no longer matches an
-  // IBM Plex 16px/Regular style.
+  // Score-based match against local styles. Font family is only a tie-breaker:
+  // designs generated with a substitute font (e.g. Inter instead of Segoe UI)
+  // still map to the design-system style with the same size / weight / lh.
+  // Weight is compared numerically, so "Semibold" ≡ "Semi Bold" ≡ "SemiBold".
+  // Returns { style, quality: 'exact' | 'close' } or null.
   function findMatch(props) {
-    const sameSizeStyle = s =>
-      s.fontSize === props.fontSize &&
-      s.fontName.style.toLowerCase() === props.fontStyle.toLowerCase();
-    const sameFamily = s => s.fontName.family === props.fontFamily;
-    const sameLh     = s => lhKey(s.lineHeight) === props.lineHeight;
+    let best = null, bestScore = Infinity;
+    for (const s of textStyles) {
+      if (!sameWeight(s.fontName.style, props.fontStyle)) continue;
+      const sizeDiff = Math.abs(s.fontSize - props.fontSize);
+      if (sizeDiff > 1) continue;
+      const score = sizeDiff * 10
+        + (lhKey(s.lineHeight) === props.lineHeight ? 0 : 3)
+        + (s.fontName.family === props.fontFamily ? 0 : 1);
+      if (score < bestScore) { best = s; bestScore = score; }
+    }
+    if (!best) return null;
+    return { style: best, quality: bestScore === 0 ? 'exact' : 'close' };
+  }
 
-    // 1) family + size + style + lineHeight   2) family + size + style
-    // 3) size + style + lineHeight            4) size + style (legacy fallback)
-    return textStyles.find(s => sameSizeStyle(s) && sameFamily(s) && sameLh(s))
-        || textStyles.find(s => sameSizeStyle(s) && sameFamily(s))
-        || textStyles.find(s => sameSizeStyle(s) && sameLh(s))
-        || textStyles.find(s => sameSizeStyle(s))
+  // ── Typography variables (local) for the "bind variables" proposal ──────
+  const allCollections = await figma.variables.getLocalVariableCollectionsAsync();
+  const allVars = await figma.variables.getLocalVariablesAsync();
+  const typoCol = allCollections.find(c => c.name.toLowerCase() === 'typography');
+  const typoVars = allVars.filter(v => (!typoCol || v.variableCollectionId === typoCol.id));
+  function varVal(v) {
+    const col = allCollections.find(c => c.id === v.variableCollectionId);
+    return col ? v.valuesByMode[col.defaultModeId] : undefined;
+  }
+  const varsByGroup = { fontSize: [], lineHeight: [], fontWeight: [], fontFamily: [] };
+  for (const v of typoVars) {
+    const g = v.name.split('/')[0];
+    if (!varsByGroup[g]) continue;
+    const val = varVal(v);
+    if (val === undefined || val === null || typeof val === 'object') continue; // skip aliases
+    varsByGroup[g].push({ id: v.id, name: v.name, value: val });
+  }
+
+  // Propose fontSize / lineHeight / fontWeight / fontFamily variables whose
+  // values match the node. Returns null unless size + weight both resolve.
+  function findVarProposal(props) {
+    const size = varsByGroup.fontSize
+      .filter(v => Math.abs(v.value - props.fontSize) <= 1)
+      .sort((a, b) => Math.abs(a.value - props.fontSize) - Math.abs(b.value - props.fontSize))[0];
+    const weight = varsByGroup.fontWeight.find(v => sameWeight(v.value, props.fontStyle));
+    if (!size || !weight) return null;
+
+    // Line height: same token as the size var if its value fits, else nearest px value
+    const token = size.name.split('/').slice(1).join('/');
+    let lh = null;
+    if (props.lineHeight.indexOf('PIXELS:') === 0) {
+      const px = parseFloat(props.lineHeight.slice(7));
+      lh = varsByGroup.lineHeight.find(v => v.name === 'lineHeight/' + token && Math.abs(v.value - px) <= 1)
+        || varsByGroup.lineHeight
+             .filter(v => Math.abs(v.value - px) <= 1)
+             .sort((a, b) => Math.abs(a.value - px) - Math.abs(b.value - px))[0]
         || null;
+    } else {
+      lh = varsByGroup.lineHeight.find(v => v.name === 'lineHeight/' + token) || null;
+    }
+    const family = varsByGroup.fontFamily.find(v => v.name === 'fontFamily/body')
+      || varsByGroup.fontFamily[0] || null;
+
+    const pick = v => v ? { id: v.id, name: v.name, value: v.value } : null;
+    return {
+      fontSize:   pick(size),
+      lineHeight: pick(lh),
+      fontWeight: pick(weight),
+      fontFamily: pick(family),
+      label: token + ' · ' + weight.name.split('/').slice(1).join('/')
+    };
   }
 
   const items = [];
+  const overrides = [];
+  const mainCache = {}; // instanceId → main ComponentNode (or null)
 
   for (const node of textNodes) {
     let context, props;
     try {
       context = getContext(node);
-      if (context === null) continue;
+      if (context === null) {
+        const ov = await checkInstanceOverride(node, mainCache, getTextProps);
+        if (ov) overrides.push(ov);
+        continue;
+      }
       props = getTextProps(node);
     } catch (_) { continue; }
     if (!props) continue;
@@ -685,12 +804,12 @@ async function auditScan(msg) {
     }
 
     // Auto-match against local styles
-    const match = findMatch(props);
+    const match = hasStyle ? null : findMatch(props);
 
-    const defaultStyleId   = hasStyle ? rawStyleId        : (match ? match.id   : null);
+    const defaultStyleId   = hasStyle ? rawStyleId        : (match ? match.style.id   : null);
     const defaultStyleName = hasStyle
       ? (currentStyle ? currentStyle.name : null)
-      : (match ? match.name : null);
+      : (match ? match.style.name : null);
 
     items.push({
       nodeId:            node.id,
@@ -701,11 +820,14 @@ async function auditScan(msg) {
       fontStyle:         props.fontStyle,
       lineHeight:        props.lineHeight,
       hasStyle,
+      hasVars:           hasBoundTextVars(node),
       currentStyleId:    hasStyle ? rawStyleId : null,
       currentStyleName:  currentStyle ? currentStyle.name : null,
       currentIsLibrary,
       matchedStyleId:    defaultStyleId,
       matchedStyleName:  defaultStyleName,
+      matchQuality:      hasStyle ? null : (match ? match.quality : null),
+      varProposal:       hasStyle ? null : findVarProposal(props),
       context
     });
   }
@@ -714,23 +836,242 @@ async function auditScan(msg) {
   const matched = items.filter(i => i.matchedStyleId).length;
 
   const localStyles = textStyles.map(s => ({ id: s.id, name: s.name, isLibrary: false }));
-  figma.ui.postMessage({ type: 'audit-results', items, total, matched, localStyles });
+  figma.ui.postMessage({ type: 'audit-results', items, total, matched, localStyles, overrides });
+}
+
+// ─── AUDIT: COMPONENT INSTANCE OVERRIDES ─────────────────────────────────────
+
+// Compare a text node inside an instance with its counterpart in the main
+// component. Returns an override record when typography differs, else null.
+// The counterpart is found by following the same child-index path from the
+// OUTERMOST instance into its main component, so nested-instance overrides
+// that the main component itself defines count as the "library" value.
+async function checkInstanceOverride(node, mainCache, getTextProps) {
+  const path = [];
+  let top = null, topPath = null, cur = node;
+  while (cur.parent && cur.parent.type !== 'PAGE' && cur.parent.type !== 'DOCUMENT') {
+    path.unshift(cur.parent.children.indexOf(cur));
+    cur = cur.parent;
+    if (cur.type === 'INSTANCE') { top = cur; topPath = path.slice(); }
+  }
+  if (!top) return null;
+
+  if (!(top.id in mainCache)) {
+    try { mainCache[top.id] = await top.getMainComponentAsync(); }
+    catch (_) { mainCache[top.id] = null; }
+  }
+  const main = mainCache[top.id];
+  if (!main) return null;
+
+  let src = main;
+  for (const idx of topPath) {
+    if (!src || !('children' in src) || idx < 0 || idx >= src.children.length) return null;
+    src = src.children[idx];
+  }
+  if (!src || src.type !== 'TEXT') return null;
+
+  const nodeSnap = typoSnapshot(node);
+  const srcSnap  = typoSnapshot(src);
+  if (!nodeSnap || !srcSnap) return null;
+
+  // Diverged if the style differs, or the node uses any typography combo
+  // the source doesn't (text content itself may legitimately differ).
+  const styleDiff = nodeSnap.styleId !== srcSnap.styleId;
+  const propsDiff = nodeSnap.keys.some(k => srcSnap.keys.indexOf(k) === -1);
+  if (!styleDiff && !propsDiff) return null;
+
+  const nodeProps = getTextProps(node);
+  const srcProps  = getTextProps(src);
+  return {
+    nodeId:        node.id,
+    nodeName:      node.name,
+    sourceNodeId:  src.id,
+    instanceName:  top.name,
+    componentName: main.parent && main.parent.type === 'COMPONENT_SET'
+      ? main.parent.name + ' / ' + main.name : main.name,
+    current: (await styleNameOf(nodeSnap.styleId)) || (nodeProps ? typoLabel(nodeProps) : '—'),
+    source:  (await styleNameOf(srcSnap.styleId))  || (srcProps  ? typoLabel(srcProps)  : '—')
+  };
+}
+
+// Typography fingerprint of a text node: its style id + the set of distinct
+// font/size/lh/letter-spacing combos across its segments.
+function typoSnapshot(n) {
+  const sid = n.textStyleId === figma.mixed ? 'mixed' : (n.textStyleId || '');
+  if (n.characters.length === 0) {
+    if (n.fontName === figma.mixed) return null;
+    return { styleId: sid, keys: [segKey(n)] };
+  }
+  const segs = n.getStyledTextSegments(['fontName', 'fontSize', 'lineHeight', 'letterSpacing']);
+  const keys = [];
+  for (const s of segs) {
+    const k = segKey(s);
+    if (keys.indexOf(k) === -1) keys.push(k);
+  }
+  return { styleId: sid, keys };
+}
+
+function segKey(s) {
+  const ls = s.letterSpacing ? s.letterSpacing.unit + ':' + Math.round(s.letterSpacing.value * 100) / 100 : '';
+  return s.fontName.family + '|' + s.fontName.style + '|' + s.fontSize + '|' + lhKey(s.lineHeight) + '|' + ls;
+}
+
+async function styleNameOf(styleId) {
+  if (!styleId || styleId === 'mixed') return styleId === 'mixed' ? 'Mixed styles' : null;
+  try {
+    const s = await figma.getStyleByIdAsync(styleId);
+    return s ? s.name : null;
+  } catch (_) { return null; }
+}
+
+// Restore a text node's typography from its main-component counterpart.
+// Text content and fills are left untouched.
+async function resetTextOverride(node, src) {
+  await loadNodeFonts(node);
+  await loadNodeFonts(src);
+
+  const srcStyle = src.textStyleId;
+  if (srcStyle && srcStyle !== figma.mixed) {
+    await setStyleId(node, srcStyle);
+    return;
+  }
+
+  // Source has no single style: copy raw props (and any bound variables)
+  if (node.textStyleId !== '') await setStyleId(node, '');
+
+  const len = node.characters.length;
+  const fields = ['fontName', 'fontSize', 'lineHeight', 'letterSpacing', 'textStyleId', 'boundVariables'];
+  const srcSegs = src.characters.length > 0
+    ? src.getStyledTextSegments(fields)
+    : [{ start: 0, end: 0, fontName: src.fontName, fontSize: src.fontSize, lineHeight: src.lineHeight,
+         letterSpacing: src.letterSpacing, textStyleId: '', boundVariables: {} }];
+
+  // Same text → copy per range; different text → apply the first segment to all
+  const ranges = (node.characters === src.characters && len > 0)
+    ? srcSegs
+    : [Object.assign({}, srcSegs[0], { start: 0, end: len })];
+
+  for (const seg of ranges) {
+    if (len === 0) {
+      node.fontName = seg.fontName;
+      node.fontSize = seg.fontSize;
+      node.lineHeight = seg.lineHeight;
+      node.letterSpacing = seg.letterSpacing;
+      continue;
+    }
+    const a = seg.start, b = seg.end;
+    if (seg.textStyleId) {
+      if (typeof node.setRangeTextStyleIdAsync === 'function') await node.setRangeTextStyleIdAsync(a, b, seg.textStyleId);
+      else node.setRangeTextStyleId(a, b, seg.textStyleId);
+      continue;
+    }
+    node.setRangeFontName(a, b, seg.fontName);
+    node.setRangeFontSize(a, b, seg.fontSize);
+    node.setRangeLineHeight(a, b, seg.lineHeight);
+    node.setRangeLetterSpacing(a, b, seg.letterSpacing);
+    const bv = seg.boundVariables || {};
+    for (const field of Object.keys(bv)) {
+      if (TEXT_VAR_FIELDS.indexOf(field) === -1 && field !== 'letterSpacing') continue;
+      try {
+        const v = await figma.variables.getVariableByIdAsync(bv[field].id);
+        if (v) node.setRangeBoundVariable(a, b, field, v);
+      } catch (_) {}
+    }
+  }
+}
+
+// Bind a proposed set of typography variables to an unstyled text node.
+// Returns the number of fields that could not be bound.
+async function bindTextVars(node, vars) {
+  await loadNodeFonts(node);
+  let failed = 0;
+  const len = node.characters.length;
+  const bind = (field, v) => {
+    if (len > 0) node.setRangeBoundVariable(0, len, field, v);
+    else node.setBoundVariable(field, v);
+  };
+
+  // Family + weight change the font → the target font must be loadable first
+  if (vars.fontFamily || vars.fontWeight) {
+    const cur = node.fontName !== figma.mixed ? node.fontName : node.getRangeFontName(0, 1);
+    const target = {
+      family: vars.fontFamily ? String(vars.fontFamily.value) : cur.family,
+      style:  vars.fontWeight ? String(vars.fontWeight.value) : cur.style
+    };
+    let loaded = true;
+    try {
+      await figma.loadFontAsync(target);
+      // Switch to the target font first so binding family/style one at a time
+      // never passes through an unloaded family+style combination.
+      if (len > 0) node.setRangeFontName(0, len, target); else node.fontName = target;
+    } catch (_) { loaded = false; }
+    for (const [field, ref] of [['fontFamily', vars.fontFamily], ['fontStyle', vars.fontWeight]]) {
+      if (!ref) continue;
+      if (!loaded) { failed++; continue; }
+      try {
+        const v = await figma.variables.getVariableByIdAsync(ref.id);
+        if (v) bind(field, v); else failed++;
+      } catch (_) { failed++; }
+    }
+  }
+
+  if (vars.fontSize) {
+    try {
+      const v = await figma.variables.getVariableByIdAsync(vars.fontSize.id);
+      if (v) bind('fontSize', v); else failed++;
+    } catch (_) { failed++; }
+  }
+  if (vars.lineHeight) {
+    try {
+      // lineHeight must be in PIXELS before a FLOAT variable can drive it
+      node.lineHeight = { unit: 'PIXELS', value: Number(vars.lineHeight.value) };
+      const v = await figma.variables.getVariableByIdAsync(vars.lineHeight.id);
+      if (v) bind('lineHeight', v); else failed++;
+    } catch (_) { failed++; }
+  }
+  return failed;
 }
 
 // ─── AUDIT: APPLY SELECTED STYLES ────────────────────────────────────────────
 
 async function auditApply(msg) {
-  const items = msg.items || []; // [{ nodeId, styleId }] — styleId may be "lib:<key>"
+  // items:  [{ nodeId, styleId, vars? }] — styleId may be "lib:<key>" or "__vars__"
+  // resets: [{ nodeId, sourceNodeId }]   — instance overrides to restore
+  const items  = msg.items  || [];
+  const resets = msg.resets || [];
   let applied = 0;
+  let bound   = 0;
+  let reset   = 0;
   let errors  = 0;
+  let partial = 0;
+
+  for (const { nodeId, sourceNodeId } of resets) {
+    try {
+      const node = await figma.getNodeByIdAsync(nodeId);
+      const src  = await figma.getNodeByIdAsync(sourceNodeId);
+      if (!node || node.type !== 'TEXT' || !src || src.type !== 'TEXT') { errors++; continue; }
+      await resetTextOverride(node, src);
+      reset++;
+    } catch (e) {
+      errors++;
+    }
+  }
 
   // Cache imported library styles within this apply batch to avoid redundant imports
   const importedByKey = {};
 
-  for (const { nodeId, styleId } of items) {
+  for (const { nodeId, styleId, vars } of items) {
     try {
       const node = await figma.getNodeByIdAsync(nodeId);
       if (!node || node.type !== 'TEXT') continue;
+
+      if (styleId === '__vars__') {
+        if (!vars) { errors++; continue; }
+        const failed = await bindTextVars(node, vars);
+        if (failed) partial++;
+        bound++;
+        continue;
+      }
 
       let resolvedStyleId = styleId;
 
@@ -744,14 +1085,14 @@ async function auditApply(msg) {
         resolvedStyleId = importedByKey[key];
       }
 
-      node.textStyleId = resolvedStyleId;
+      await setStyleId(node, resolvedStyleId);
       applied++;
     } catch (e) {
       errors++;
     }
   }
 
-  figma.ui.postMessage({ type: 'audit-applied', applied, errors });
+  figma.ui.postMessage({ type: 'audit-applied', applied, bound, reset, partial, errors });
 }
 
 // ─── AUDIT: SELECT NODES IN FIGMA ────────────────────────────────────────────

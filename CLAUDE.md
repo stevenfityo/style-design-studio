@@ -36,7 +36,7 @@ The plugin follows the standard Figma plugin split:
 | UI → code | `create-scale` | Create the `Primitive/scale` variables at a given base |
 | UI → code | `update-scale` | Rescale `Primitive/scale` to a new base (14 ⇄ 16) |
 | UI → code | `audit-scan` | Scan text nodes for missing/mismatched styles |
-| UI → code | `audit-apply` | Apply chosen styles to scanned nodes |
+| UI → code | `audit-apply` | Apply chosen styles / bind variables / reset instance overrides |
 | UI → code | `audit-select` | Select scanned nodes on the canvas |
 | UI → code | `load-settings` / `save-settings` | Read/write settings in `figma.clientStorage` |
 | UI → code | `cancel` | Close the plugin |
@@ -52,8 +52,8 @@ The plugin follows the standard Figma plugin split:
 | code → UI | `colors-created` | Reports created/skipped color-variable counts |
 | code → UI | `scale-ready` | Reports whether `Primitive/scale` exists + current base/count |
 | code → UI | `scale-created` / `scale-updated` | Scale created / rescaled (base, count) |
-| code → UI | `audit-results` | Scanned items, totals, and local styles |
-| code → UI | `audit-applied` | Reports applied/errors counts |
+| code → UI | `audit-results` | Scanned items, totals, local styles, and instance `overrides` |
+| code → UI | `audit-applied` | Reports applied/bound/reset/partial/errors counts |
 | code → UI | `settings-loaded` / `settings-saved` | Settings round-trip acknowledgements |
 | code → UI | `error` | Generic error string |
 
@@ -68,6 +68,30 @@ The plugin follows the standard Figma plugin split:
   sizes:   string[],           // token names — kept for backwards compat
   weights: string[],           // weight labels — kept for backwards compat
 }
+```
+
+### Audit (`audit-results` / `audit-apply`)
+
+Text outside instances is matched to a style by **weight (numeric, font-agnostic) +
+size (±1px)**, with line height and font family only as tie-breakers. This way a
+design built with a substitute font (Inter instead of Segoe UI) still maps to the
+design-system style. `parseFontStyle` exists in both `code.js` and `ui.html` and
+must stay in sync. When no style matches, `varProposal` suggests binding local
+Typography variables (`fontSize/*`, `lineHeight/*`, `fontWeight/*`, `fontFamily/body`).
+
+Text inside instances is not restyled. Each one is compared with its counterpart
+in the outermost instance's main component (same child-index path). Typography
+that differs is reported in `overrides` and can be reset; text content is kept.
+
+```js
+// audit-results item (unstyled)
+{ nodeId, hasStyle, hasVars, matchedStyleId, matchQuality: 'exact'|'close'|null,
+  varProposal: { fontSize, lineHeight, fontWeight, fontFamily, label } | null, ... }
+// audit-results.overrides[]
+{ nodeId, nodeName, sourceNodeId, instanceName, componentName, current, source }
+// audit-apply
+{ items: [{ nodeId, styleId /* id | "lib:<key>" | "__vars__" */, vars? }],
+  resets: [{ nodeId, sourceNodeId }] }
 ```
 
 ### `create-missing-tokens`
